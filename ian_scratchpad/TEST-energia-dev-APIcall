@@ -1,0 +1,223 @@
+import os
+import json
+import logging
+import re
+import urllib.request
+import urllib.error
+import gzip
+import zlib
+from typing import Dict, Any, Tuple
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+TIMEOUT_SECONDS = 20
+
+
+def _get_env_required(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise ValueError(f"Missing required environment variable: {name}")
+    return value
+
+
+def _decode_body(body_bytes: bytes, headers: Dict[str, str]) -> str:
+    """
+    Decompress if Content-Encoding says gzip/deflate, then decode as UTF-8.
+    """
+    encoding = (headers.get("Content-Encoding") or headers.get("content-encoding") or "").lower().strip()
+
+    if encoding == "gzip":
+        body_bytes = gzip.decompress(body_bytes)
+    elif encoding == "deflate":
+        # deflate can be zlib-wrapped or raw; try both
+        try:
+            body_bytes = zlib.decompress(body_bytes)
+        except zlib.error:
+            body_bytes = zlib.decompress(body_bytes, -zlib.MAX_WBITS)
+
+    return body_bytes.decode("utf-8", errors="replace")
+
+
+def _sanitize_json(raw: str) -> str:
+    """
+    Fix malformed JSON from upstream where values are missing, e.g.:
+      "meterCount": ,       -> "meterCount": null,
+      "meterCount":  }      -> "meterCount": null }
+      "meterCount":  ]      -> "meterCount": null ]
+    """
+    # Match a colon followed by optional whitespace then a comma, } or ]
+    # (i.e. a missing value)
+    return re.sub(r':\s*([,\}\]])', r': null\1', raw)
+
+
+def _resolve_url(event: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Requires event.system to be 'c2m' or 'ccb' and picks the external URL from env vars.
+    """
+    system = str(event.get("system") or "").strip().lower()
+    if system not in ("c2m", "ccb"):
+        raise ValueError("Event must include 'system' with value 'c2m' or 'ccb'")
+
+    if system == "c2m":
+        return system, _get_env_required("C2M_ENDPOINT_URL")
+    else:
+        return system, _get_env_required("CCB_ENDPOINT_URL")
+
+def _build_request_payload(event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Accept exactly one of:
+      - acctId (single)
+      - acctIds (list of 1+)
+      - kprn
+    """
+    acct_id = event.get("acctId")
+    acct_ids = event.get("acctIds")
+    kprn = event.get("kprn")
+
+    provided = [v for v in (acct_id, acct_ids, kprn) if v is not None]
+    if len(provided) != 1:
+        raise ValueError("Provide exactly one of 'acctId', 'acctIds', or 'kprn'.")
+
+    if acct_id:
+        return {
+            "cM-AZIdVerification": {
+                "input": {
+                    "acctId": str(acct_id)
+                }
+            }
+        }
+
+    if acct_ids:
+        if not isinstance(acct_ids, list) or not acct_ids:
+            raise ValueError("'acctIds' must be a non-empty list")
+
+        return {
+            "cM-AZIdVerification": {
+                "input": {
+                    "acctIds": [str(a) for a in acct_ids]
+                }
+            }
+        }
+
+    if kprn:
+        return {
+            "cM-AZIdVerification": {
+                "input": {
+                    "kprn": str(kprn)
+                }
+            }
+        }
+
+
+def _ensure_input_shape(service_json: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensure the returned JSON contains:
+      cM-AZIdVerification.input.acctId and .kprn keys as nulls,
+    matching your desired output shape.
+    """
+    if "cM-AZIdVerification" not in service_json or not isinstance(service_json["cM-AZIdVerification"], dict):
+        return service_json
+
+    root = service_json["cM-AZIdVerification"]
+
+    if "input" not in root or not isinstance(root["input"], dict):
+        root["input"] = {}
+
+    root["input"].setdefault("acctId", None)
+    root["input"].setdefault("kprn", None)
+
+    # Keep both as null to match your example output
+    root["input"]["acctId"] = None
+    root["input"]["kprn"] = None
+
+    return service_json
+
+
+def _post_json(url: str, payload: Dict[str, Any], subscription_key: str) -> Tuple[int, str]:
+    user_agent = os.getenv("USER_AGENT", "PostmanRuntime/7.36.1")
+
+    headers = {
+        "Ocp-Apim-Subscription-Key": subscription_key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": user_agent,
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "close",
+    }
+
+    data_bytes = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url=url, data=data_bytes, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+            resp_headers = dict(resp.headers)
+            body_bytes = resp.read()
+            raw_text = _decode_body(body_bytes, resp_headers)
+            return resp.status, raw_text
+
+    except urllib.error.HTTPError as e:
+        resp_headers = dict(e.headers) if e.headers else {}
+        body_bytes = e.read() if e.fp else b""
+        raw_text = _decode_body(body_bytes, resp_headers) if body_bytes else ""
+        return e.code, raw_text
+
+
+def lambda_handler(event, context):
+    if not isinstance(event, dict):
+        return {"error": "Event must be a JSON object/dict"}
+
+    try:
+        subscription_key = _get_env_required("SUBSCRIPTION_KEY")
+        system, url = _resolve_url(event)
+
+        acct_ids = event.get("acctIds")
+
+        # ✅ fan-out mode
+        if acct_ids:
+            results = []
+            for acct_id in acct_ids:
+                payload = {
+                    "cM-AZIdVerification": {
+                        "input": {"acctId": str(acct_id)}
+                    }
+                }
+
+                status_code, raw_body = _post_json(url, payload, subscription_key)
+
+                if 200 <= status_code < 300 and raw_body:
+                    try:
+                        service_json = json.loads(_sanitize_json(raw_body))
+                    except json.JSONDecodeError as je:
+                        logger.error(f"Invalid JSON for acctId={acct_id}: {raw_body[:500]}")
+                        results.append({
+                            "acctId": acct_id,
+                            "error": f"Invalid JSON from upstream: {str(je)}",
+                            "raw_body_preview": raw_body[:500]
+                        })
+                        continue
+                    results.append({
+                        "acctId": acct_id,
+                        "result": _ensure_input_shape(service_json)
+                    })
+                else:
+                    results.append({
+                        "acctId": acct_id,
+                        "error": raw_body[:500] if raw_body else "Empty response from upstream",
+                        "status_code": status_code
+                    })
+
+            return {"results": results}
+
+        # ✅ existing single-call behaviour unchanged
+        payload = _build_request_payload(event)
+        status_code, raw_body = _post_json(url, payload, subscription_key)
+
+        if not (200 <= status_code < 300):
+            return {"error": raw_body}
+
+        service_json = json.loads(_sanitize_json(raw_body))
+        return _ensure_input_shape(service_json)
+
+    except Exception as e:
+        return {"error": str(e)}
